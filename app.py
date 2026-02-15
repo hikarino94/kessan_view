@@ -367,32 +367,24 @@ if total_scores > 0:
         prog_profit = prog.get("純利")
         tdoc = tdnet_map.get(score.code, {})
         ranking_rows.append({
-            "スコア": round(score.total_score, 1),
+            "点": round(score.total_score, 1),
             "区分": score.category or "通常",
             "コード": score.code,
-            "銘柄名": name or "",
-            "セクター": (sector or "")[:6],
-            "売上YoY": f"{score.yoy_sales_change:+.1f}" if score.yoy_sales_change is not None else "-",
-            "営利YoY": f"{score.yoy_op_change:+.1f}" if score.yoy_op_change is not None else "-",
+            "銘柄名": (name or "")[:8],
             "純利YoY": f"{score.yoy_profit_change:+.1f}" if score.yoy_profit_change is not None else "-",
-            "進捗%": f"{prog_profit:.0f}" if prog_profit is not None else "-",
-            "PDF": "✅" if tdoc.get("pdf_local_path") and Path(tdoc["pdf_local_path"]).exists() else "",
+            "進捗": f"{prog_profit:.0f}" if prog_profit is not None else "-",
         })
         ranking_codes.append(score.code)
 elif tdnet_count > 0:
     # スコアリング未実施: TDnetデータを表示
     for code, info in sorted(tdnet_map.items()):
         ranking_rows.append({
-            "スコア": "-",
+            "点": "-",
             "区分": "-",
             "コード": code,
-            "銘柄名": info["company_name"],
-            "セクター": "",
-            "売上YoY": "-",
-            "営利YoY": "-",
+            "銘柄名": (info["company_name"] or "")[:8],
             "純利YoY": "-",
-            "進捗%": "-",
-            "PDF": "✅" if info["pdf_local_path"] and Path(info["pdf_local_path"]).exists() else "",
+            "進捗": "-",
         })
         ranking_codes.append(code)
 
@@ -423,7 +415,7 @@ with left_col:
             filtered_rows = []
             filtered_codes = []
             for row, code in zip(ranking_rows, ranking_codes):
-                if row["スコア"] != "-" and row["スコア"] < min_score:
+                if row["点"] != "-" and row["点"] < min_score:
                     continue
                 if category_filter and row["区分"] not in category_filter:
                     continue
@@ -440,8 +432,8 @@ with left_col:
 
             column_config = {}
             if total_scores > 0:
-                column_config["スコア"] = st.column_config.ProgressColumn(
-                    "スコア", min_value=0, max_value=100, format="%.0f"
+                column_config["点"] = st.column_config.ProgressColumn(
+                    "点", min_value=0, max_value=100, format="%.0f", width="small"
                 )
 
             event = st.dataframe(
@@ -669,7 +661,7 @@ with right_col:
                     st.markdown(f"**{doc['title'] or '書類'}**")
                     dc1, dc2 = st.columns(2)
                     if doc["document_url"]:
-                        dc1.link_button("🔗 TDnetで開く", doc["document_url"], use_container_width=True, key=f"doc_tdnet_{di}")
+                        dc1.link_button("🔗 TDnetで開く", doc["document_url"], use_container_width=True)
                     lp = doc.get("pdf_local_path", "")
                     if lp and Path(lp).exists():
                         dc2.download_button("📥 保存済PDF", data=Path(lp).read_bytes(),
