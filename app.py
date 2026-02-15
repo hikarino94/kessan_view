@@ -367,24 +367,32 @@ if total_scores > 0:
         prog_profit = prog.get("純利")
         tdoc = tdnet_map.get(score.code, {})
         ranking_rows.append({
-            "点": round(score.total_score, 1),
-            "区分": score.category or "通常",
-            "コード": score.code,
-            "銘柄名": (name or "")[:8],
-            "純利YoY": f"{score.yoy_profit_change:+.1f}" if score.yoy_profit_change is not None else "-",
-            "進捗": f"{prog_profit:.0f}" if prog_profit is not None else "-",
+            "score": round(score.total_score, 1),
+            "category": score.category or "通常",
+            "code": score.code,
+            "name": name or "",
+            "sector": (sector or "")[:6],
+            "yoy_sales": f"{score.yoy_sales_change:+.1f}" if score.yoy_sales_change is not None else "-",
+            "yoy_op": f"{score.yoy_op_change:+.1f}" if score.yoy_op_change is not None else "-",
+            "yoy_profit": f"{score.yoy_profit_change:+.1f}" if score.yoy_profit_change is not None else "-",
+            "progress": f"{prog_profit:.0f}" if prog_profit is not None else "-",
+            "pdf": "✅" if tdoc.get("pdf_local_path") and Path(tdoc["pdf_local_path"]).exists() else "",
         })
         ranking_codes.append(score.code)
 elif tdnet_count > 0:
     # スコアリング未実施: TDnetデータを表示
     for code, info in sorted(tdnet_map.items()):
         ranking_rows.append({
-            "点": "-",
-            "区分": "-",
-            "コード": code,
-            "銘柄名": (info["company_name"] or "")[:8],
-            "純利YoY": "-",
-            "進捗": "-",
+            "score": "-",
+            "category": "-",
+            "code": code,
+            "name": info["company_name"] or "",
+            "sector": "",
+            "yoy_sales": "-",
+            "yoy_op": "-",
+            "yoy_profit": "-",
+            "progress": "-",
+            "pdf": "✅" if info["pdf_local_path"] and Path(info["pdf_local_path"]).exists() else "",
         })
         ranking_codes.append(code)
 
@@ -395,7 +403,7 @@ elif tdnet_count > 0:
 left_col, right_col = st.columns([2, 3], gap="medium")
 
 # ───────────────────────────────────────────
-# 左カラム: ランキング一覧
+# 左カラム: ランキング一覧 (2行カード形式)
 # ───────────────────────────────────────────
 with left_col:
     st.markdown('<div class="section-header">🏆 一覧</div>', unsafe_allow_html=True)
@@ -415,9 +423,9 @@ with left_col:
             filtered_rows = []
             filtered_codes = []
             for row, code in zip(ranking_rows, ranking_codes):
-                if row["点"] != "-" and row["点"] < min_score:
+                if row["score"] != "-" and row["score"] < min_score:
                     continue
-                if category_filter and row["区分"] not in category_filter:
+                if category_filter and row["category"] not in category_filter:
                     continue
                 filtered_rows.append(row)
                 filtered_codes.append(code)
@@ -425,68 +433,76 @@ with left_col:
             filtered_rows = ranking_rows
             filtered_codes = ranking_codes
 
-        st.caption(f"{len(filtered_rows)}件表示 — 行クリックで右側に詳細表示")
+        # セレクトボックス (実際の選択用)
+        code_label_map = {code: f"{row['code']} {row['name']}" for row, code in zip(filtered_rows, filtered_codes)}
+        default_idx = 0
+        if st.session_state.selected_code in filtered_codes:
+            default_idx = filtered_codes.index(st.session_state.selected_code)
 
-        if filtered_rows:
-            df = pd.DataFrame(filtered_rows)
+        selected = st.selectbox(
+            f"銘柄選択 ({len(filtered_rows)}件)",
+            options=filtered_codes,
+            index=default_idx,
+            format_func=lambda c: code_label_map.get(c, c),
+            key="stock_selector",
+        )
+        st.session_state.selected_code = selected
 
-            column_config = {}
-            if total_scores > 0:
-                column_config["点"] = st.column_config.ProgressColumn(
-                    "点", min_value=0, max_value=100, format="%.0f", width="small"
-                )
+        # 2行カードのHTML表示
+        cat_colors = {"注目": "#e74c3c", "要確認": "#f39c12", "通常": "#95a5a6", "-": "#bbb"}
+        cards_html = '<div style="max-height:580px;overflow-y:auto;border:1px solid #e0e0e0;border-radius:8px;">'
+        for row, code in zip(filtered_rows, filtered_codes):
+            is_sel = code == selected
+            bg = "#e8f0fe" if is_sel else "#fff"
+            border_l = "border-left:4px solid #667eea;" if is_sel else "border-left:4px solid transparent;"
+            cat_c = cat_colors.get(row["category"], "#95a5a6")
+            score_display = f'{row["score"]}' if row["score"] != "-" else "-"
+            cards_html += f'''<div style="padding:5px 8px;border-bottom:1px solid #f0f0f0;background:{bg};{border_l}">
+  <div style="display:flex;justify-content:space-between;align-items:center;line-height:1.3;">
+    <span style="font-size:13px;"><b>{row["code"]}</b> {row["name"][:8]} <span style="color:#999;font-size:11px;">{row["sector"]}</span></span>
+    <span style="display:flex;gap:3px;align-items:center;">
+      <span style="background:{cat_c};color:white;padding:0 5px;border-radius:6px;font-size:11px;">{row["category"]}{score_display}</span>
+      <span style="font-size:11px;">{row["pdf"]}</span>
+    </span>
+  </div>
+  <div style="display:flex;gap:6px;font-size:11px;color:#555;line-height:1.3;">
+    <span>売<b>{row["yoy_sales"]}</b></span>
+    <span>営<b>{row["yoy_op"]}</b></span>
+    <span>純<b>{row["yoy_profit"]}</b></span>
+    <span>進捗<b>{row["progress"]}%</b></span>
+  </div>
+</div>'''
+        cards_html += '</div>'
+        st.markdown(cards_html, unsafe_allow_html=True)
 
-            event = st.dataframe(
-                df,
-                width="stretch",
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                height=min(700, 35 * len(filtered_rows) + 40),
-                column_config=column_config,
-                key="main_ranking",
-            )
+        # 選択中の銘柄に対するアクションボタン
+        if st.session_state.selected_code:
+            sel = st.session_state.selected_code
+            tdoc = tdnet_map.get(sel, {})
 
-            # 選択された行 → selected_code を更新
-            if event and event.selection and event.selection.rows:
-                sel_idx = event.selection.rows[0]
-                if sel_idx < len(filtered_codes):
-                    st.session_state.selected_code = filtered_codes[sel_idx]
-
-            # 選択中の銘柄に対するアクションボタン
-            if st.session_state.selected_code:
-                sel = st.session_state.selected_code
-                tdoc = tdnet_map.get(sel, {})
-                sel_name = ""
-                for row in filtered_rows:
-                    if row["コード"] == sel:
-                        sel_name = row["銘柄名"]
-                        break
-
-                st.markdown(f"**▶ {sel} {sel_name}**")
-                ac1, ac2, ac3 = st.columns(3)
-                with ac1:
-                    if tdoc.get("document_url"):
-                        st.link_button("📄 TDnet", tdoc["document_url"], use_container_width=True)
-                    else:
-                        st.button("📄 TDnet", disabled=True, use_container_width=True, key="left_tdnet_dis")
-                with ac2:
-                    pp = tdoc.get("pdf_local_path", "")
-                    if pp and Path(pp).exists():
-                        st.download_button("📥 PDF", data=Path(pp).read_bytes(),
-                                           file_name=Path(pp).name, mime="application/pdf",
-                                           use_container_width=True, key="left_pdf_dl")
-                    else:
-                        st.button("📥 PDF", disabled=True, use_container_width=True, key="left_pdf_dis")
-                with ac3:
-                    if st.button("🤖 AI分析", use_container_width=True, key="left_ai_btn"):
-                        with st.spinner(f"{sel} AI分析中..."):
-                            result = run_single_ai_analysis(sel, target_date_str)
-                            if result.get("is_error"):
-                                st.error(result.get("error", ""))
-                            else:
-                                st.success("完了!")
-                        st.rerun()
+            ac1, ac2, ac3 = st.columns(3)
+            with ac1:
+                if tdoc.get("document_url"):
+                    st.link_button("📄 TDnet", tdoc["document_url"], use_container_width=True)
+                else:
+                    st.button("📄 TDnet", disabled=True, use_container_width=True, key="left_tdnet_dis")
+            with ac2:
+                pp = tdoc.get("pdf_local_path", "")
+                if pp and Path(pp).exists():
+                    st.download_button("📥 PDF", data=Path(pp).read_bytes(),
+                                       file_name=Path(pp).name, mime="application/pdf",
+                                       use_container_width=True, key="left_pdf_dl")
+                else:
+                    st.button("📥 PDF", disabled=True, use_container_width=True, key="left_pdf_dis")
+            with ac3:
+                if st.button("🤖 AI分析", use_container_width=True, key="left_ai_btn"):
+                    with st.spinner(f"{sel} AI分析中..."):
+                        result = run_single_ai_analysis(sel, target_date_str)
+                        if result.get("is_error"):
+                            st.error(result.get("error", ""))
+                        else:
+                            st.success("完了!")
+                    st.rerun()
 
 
 # ───────────────────────────────────────────
