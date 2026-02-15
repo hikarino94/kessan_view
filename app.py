@@ -1,10 +1,11 @@
 """KessanView - 決算分析補助ツール
 
 シングルページ構成のStreamlitアプリ。
-スクロールで全情報を閲覧可能。設定はサイドバーに配置。
+左右2カラムレイアウトでランキングと詳細を同時閲覧可能。
 """
 import json
 import logging
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -45,23 +46,30 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main .block-container {
-        padding-top: 1rem;
-        max-width: 1400px;
+        padding-top: 0.5rem;
+        max-width: 1600px;
     }
     div[data-testid="stMetric"] {
         background: linear-gradient(135deg, #f8f9fa, #e9ecef);
-        border-radius: 12px;
-        padding: 16px;
-        border-left: 4px solid #667eea;
+        border-radius: 10px;
+        padding: 10px;
+        border-left: 3px solid #667eea;
     }
     .section-header {
         background: linear-gradient(90deg, #667eea, #764ba2);
         color: white;
-        padding: 8px 16px;
+        padding: 6px 14px;
         border-radius: 8px;
-        margin: 16px 0 8px 0;
-        font-size: 18px;
+        margin: 8px 0 6px 0;
+        font-size: 16px;
         font-weight: bold;
+    }
+    /* ランキング選択行のハイライト */
+    .selected-stock {
+        background: #e8f0fe;
+        border-radius: 6px;
+        padding: 4px 8px;
+        margin: 4px 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -83,10 +91,7 @@ def get_forecast_progress_batch(codes: list, dt) -> dict:
     try:
         stmts = (
             session.query(FinancialStatement)
-            .filter(
-                FinancialStatement.code.in_(codes),
-                FinancialStatement.disclosed_date == dt,
-            )
+            .filter(FinancialStatement.code.in_(codes), FinancialStatement.disclosed_date == dt)
             .all()
         )
         results = {}
@@ -115,10 +120,7 @@ def get_tdnet_map(dt) -> dict:
     try:
         docs = (
             session.query(TDnetDisclosure)
-            .filter(
-                TDnetDisclosure.disclosed_date == dt,
-                TDnetDisclosure.is_earnings_report == 1,
-            )
+            .filter(TDnetDisclosure.disclosed_date == dt, TDnetDisclosure.is_earnings_report == 1)
             .all()
         )
         result = {}
@@ -138,7 +140,6 @@ def get_tdnet_map(dt) -> dict:
 def run_single_ai_analysis(code: str, dt_str: str):
     """単一銘柄のAI分析を実行"""
     from services.ai_analyzer import AIAnalyzer
-
     session = get_session()
     try:
         disclosure = (
@@ -159,12 +160,50 @@ def run_single_ai_analysis(code: str, dt_str: str):
 
     analyzer = AIAnalyzer()
     return analyzer.analyze_and_save(
-        pdf_path=pdf_path,
-        code=code,
-        disclosed_date=dt_str,
-        disclosure_number="",
-        company_name=company_name,
+        pdf_path=pdf_path, code=code, disclosed_date=dt_str,
+        disclosure_number="", company_name=company_name,
     )
+
+
+def parse_ai_display(ai_result) -> dict:
+    """AI分析結果を表示用に整形。壊れたJSON保存データもリカバリ"""
+    summary_text = ai_result.summary or ""
+
+    if summary_text.startswith("分析エラー:"):
+        return {"is_error": True, "error": summary_text}
+
+    display = {"summary": summary_text, "key_points": [], "keywords": [],
+               "signal_words": [], "sentiment": ai_result.sentiment or "neutral"}
+
+    if summary_text.lstrip().startswith(("{", "```")):
+        # JSONが直接summaryに格納されたケースのリカバリ
+        fence_m = re.search(r'```(?:json)?\s*\n?(\{.*)', summary_text, re.DOTALL)
+        json_candidate = fence_m.group(1).rstrip('`').strip() if fence_m else summary_text.strip().lstrip('`').strip()
+        if json_candidate.count("{") > json_candidate.count("}"):
+            json_candidate += "}" * (json_candidate.count("{") - json_candidate.count("}"))
+        try:
+            parsed = json.loads(json_candidate)
+            display["summary"] = parsed.get("summary", summary_text[:300])
+            display["key_points"] = parsed.get("key_points", [])
+            display["keywords"] = parsed.get("keywords", [])
+            display["signal_words"] = parsed.get("signal_words", [])
+            display["sentiment"] = parsed.get("sentiment", display["sentiment"])
+        except (json.JSONDecodeError, AttributeError):
+            sum_m = re.search(r'"summary"\s*:\s*"([^"]*)"', summary_text)
+            if sum_m:
+                display["summary"] = sum_m.group(1)
+    else:
+        # 正常データ
+        for field, key in [("key_points", "key_points"), ("keywords", "keywords"), ("signal_words", "signal_words")]:
+            raw = getattr(ai_result, field, None)
+            if raw:
+                try:
+                    display[key] = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+
+    display["is_error"] = False
+    return display
 
 
 # ═══════════════════════════════════════════
@@ -176,21 +215,17 @@ with st.sidebar:
     st.subheader("📅 対象日付")
     try:
         default_date = datetime.strptime(config.DEV_TEST_DATE, "%Y-%m-%d").date()
-    except:
+    except Exception:
         default_date = date.today()
 
-    target_date = st.date_input("分析対象日", value=default_date, help="決算発表日を指定")
+    target_date = st.date_input("分析対象日", value=default_date)
     target_date_str = target_date.strftime("%Y-%m-%d")
 
     st.divider()
-
     st.subheader("🔑 API設定")
-    st.caption(f"J-Quants プラン: **{config.JQUANTS_PLAN.upper()}**")
-    st.caption(f"レート制限: {config.JQUANTS_RATE_LIMITS.get(config.JQUANTS_PLAN, '?')} req/min")
     st.caption(f"J-Quants: {'✅' if config.JQUANTS_API_KEY else '❌'} | Gemini: {'✅' if config.GEMINI_API_KEY else '❌'}")
 
     st.divider()
-
     st.subheader("📊 スコアリング重み")
     w = dict(config.DEFAULT_SCORING_WEIGHTS)
     w["yoy_sales"] = st.slider("売上高YoY", 0.0, 1.0, w["yoy_sales"], 0.05)
@@ -205,11 +240,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔄 データ同期")
-
-    sync_type = st.selectbox(
-        "同期タイプ",
-        ["銘柄マスタ", "決算情報 (日付指定)", "株価 (日付指定)", "TDnet開示情報", "全て"],
-    )
+    sync_type = st.selectbox("同期タイプ", ["銘柄マスタ", "決算情報 (日付指定)", "株価 (日付指定)", "TDnet開示情報", "全て"])
 
     if st.button("▶️ 同期実行", type="primary", use_container_width=True):
         try:
@@ -237,7 +268,7 @@ with st.sidebar:
     if st.button("📥 決算短信PDF一括DL", use_container_width=True):
         try:
             from services.tdnet import TDnetClient
-            with st.spinner(f"PDFダウンロード中... ({target_date_str})"):
+            with st.spinner(f"PDFダウンロード中..."):
                 results = TDnetClient().download_all_earnings_pdfs(target_date_str)
                 st.success(f"PDF: {sum(1 for r in results if r['success'])}/{len(results)}件DL完了")
         except Exception as e:
@@ -283,8 +314,7 @@ with st.sidebar:
 # ═══════════════════════════════════════════
 # ヘッダー + サマリー
 # ═══════════════════════════════════════════
-st.title("📊 KessanView")
-st.caption("決算分析補助ツール — 決算短信の効率的スクリーニング")
+st.markdown(f"## 📊 KessanView — {target_date_str}")
 
 dt = datetime.strptime(target_date_str, "%Y-%m-%d").date()
 
@@ -299,310 +329,206 @@ try:
 finally:
     session.close()
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("📅 対象日", target_date_str)
-c2.metric("📋 決算発表", f"{total_statements}件")
-c3.metric("🏆 注目", f"{attention_count}件")
-c4.metric("👁️ 要確認", f"{check_count}件")
-c5.metric("📄 TDnet", f"{tdnet_count}件")
-c6.metric("🤖 AI分析済", f"{ai_count}件")
-
+mc = st.columns(6)
+mc[0].metric("📋 決算", f"{total_statements}件")
+mc[1].metric("🏆 注目", f"{attention_count}件")
+mc[2].metric("👁️ 要確認", f"{check_count}件")
+mc[3].metric("📄 TDnet", f"{tdnet_count}件")
+mc[4].metric("🤖 AI済", f"{ai_count}件")
+mc[5].metric("📊 スコア", f"{total_scores}件")
 
 # ═══════════════════════════════════════════
-# TDnet情報を一括取得 (全セクションで共有)
+# データの一括取得
 # ═══════════════════════════════════════════
 tdnet_map = get_tdnet_map(dt)
 
+# ランキング/一覧データの構築
+ranking_rows = []
+ranking_codes = []
 
-# ═══════════════════════════════════════════
-# セクション1: 重要度スコアランキング
-# ═══════════════════════════════════════════
-st.markdown('<div class="section-header">🏆 重要度スコアランキング</div>', unsafe_allow_html=True)
-
-if total_scores == 0 and tdnet_count > 0:
-    # ── スコアリング未実施: TDnet開示一覧を表示 ──
-    st.info("📊 スコアリングデータなし。TDnet開示情報を一覧表示しています。")
-
-    tdnet_rows = []
-    for code, info in sorted(tdnet_map.items()):
-        tdnet_rows.append({
-            "コード": code,
-            "企業名": info["company_name"],
-            "タイトル": info["title"][:50],
-            "PDF": "✅" if info["pdf_local_path"] and Path(info["pdf_local_path"]).exists() else "❌",
-            "TDnet": "🔗" if info["document_url"] else "",
-        })
-
-    if tdnet_rows:
-        tdnet_df = pd.DataFrame(tdnet_rows)
-        st.caption(f"📄 TDnet開示情報（決算短信）: {len(tdnet_rows)}件 — 行を選択して詳細表示")
-
-        event = st.dataframe(
-            tdnet_df,
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            height=min(600, 35 * len(tdnet_rows) + 40),
-            key="tdnet_ranking",
-        )
-
-        # 選択された行の銘柄を取得 + アクションボタン表示
-        if event and event.selection and event.selection.rows:
-            sel_idx = event.selection.rows[0]
-            if sel_idx < len(tdnet_rows):
-                sel_code = tdnet_rows[sel_idx]["コード"]
-                st.session_state.selected_code = sel_code
-                sel_info = tdnet_map.get(sel_code, {})
-
-                st.markdown(f"**選択中: {sel_code} {sel_info.get('company_name', '')}**")
-                btn_c1, btn_c2, btn_c3 = st.columns(3)
-                with btn_c1:
-                    if sel_info.get("document_url"):
-                        st.link_button("📄 TDnetで開く", sel_info["document_url"], use_container_width=True)
-                    else:
-                        st.button("📄 TDnet未取得", disabled=True, use_container_width=True)
-                with btn_c2:
-                    pp = sel_info.get("pdf_local_path", "")
-                    if pp and Path(pp).exists():
-                        st.download_button("📥 PDFダウンロード", data=Path(pp).read_bytes(),
-                                           file_name=Path(pp).name, mime="application/pdf",
-                                           use_container_width=True, key="tdnet_sel_dl")
-                    else:
-                        st.button("📥 PDF未DL", disabled=True, use_container_width=True)
-                with btn_c3:
-                    if st.button("🤖 AI分析実行", use_container_width=True, key="tdnet_sel_ai"):
-                        with st.spinner(f"{sel_code} AI分析中..."):
-                            result = run_single_ai_analysis(sel_code, target_date_str)
-                            if result.get("is_error"):
-                                st.error(f"AI分析エラー: {result.get('error', '')}")
-                            else:
-                                st.success("AI分析完了!")
-                        st.rerun()
-
-elif total_scores == 0:
-    st.info("📊 データがありません。サイドバーから「データ同期」を実行してください。")
-
-else:
-    # ── スコアランキング (st.dataframe) ──
-    # フィルタ
-    fc1, fc2, fc3 = st.columns([1, 1, 2])
-    with fc1:
-        min_score = st.slider("最低スコア", 0, 100, 0, 5)
-    with fc2:
-        category_filter = st.multiselect("カテゴリ", ["注目", "要確認", "通常"], default=["注目", "要確認"])
-    with fc3:
-        session = get_session()
-        try:
-            sectors = [r[0] for r in session.query(Stock.sector_33_name).distinct().all() if r[0]]
-        finally:
-            session.close()
-        sector_filter = st.multiselect("セクター", sectors)
-
-    # データ一括取得
+if total_scores > 0:
     session = get_session()
     try:
-        query = (
+        scores_data = (
             session.query(EarningsScore, Stock.name, Stock.sector_33_name)
             .outerjoin(Stock, EarningsScore.code == Stock.code)
-            .filter(EarningsScore.disclosed_date == dt, EarningsScore.total_score >= min_score)
+            .filter(EarningsScore.disclosed_date == dt)
+            .order_by(EarningsScore.total_score.desc())
+            .all()
         )
-        if category_filter:
-            query = query.filter(EarningsScore.category.in_(category_filter))
-        scores_data = query.order_by(EarningsScore.total_score.desc()).all()
     finally:
         session.close()
 
-    # 進捗率を一括取得
     all_codes = [s.code for s, _, _ in scores_data]
     progress_map = get_forecast_progress_batch(all_codes, dt)
 
-    # DataFrameを構築
-    rows = []
-    row_codes = []
     for score, name, sector in scores_data:
-        if sector_filter and sector not in sector_filter:
-            continue
         prog = progress_map.get(score.code, {})
         prog_profit = prog.get("純利")
-        std = prog.get("standard", 0)
         tdoc = tdnet_map.get(score.code, {})
-
-        rows.append({
+        ranking_rows.append({
             "スコア": round(score.total_score, 1),
             "区分": score.category or "通常",
             "コード": score.code,
             "銘柄名": name or "",
-            "セクター": (sector or "")[:8],
-            "売上YoY%": f"{score.yoy_sales_change:+.1f}" if score.yoy_sales_change is not None else "-",
-            "営利YoY%": f"{score.yoy_op_change:+.1f}" if score.yoy_op_change is not None else "-",
-            "純利YoY%": f"{score.yoy_profit_change:+.1f}" if score.yoy_profit_change is not None else "-",
-            "修正": "↑" if score.revision_flag == 1 else ("↓" if score.revision_flag == -1 else "-"),
-            "転換": "黒" if score.turnaround_flag == 1 else ("赤" if score.turnaround_flag == -1 else "-"),
+            "セクター": (sector or "")[:6],
+            "売上YoY": f"{score.yoy_sales_change:+.1f}" if score.yoy_sales_change is not None else "-",
+            "営利YoY": f"{score.yoy_op_change:+.1f}" if score.yoy_op_change is not None else "-",
+            "純利YoY": f"{score.yoy_profit_change:+.1f}" if score.yoy_profit_change is not None else "-",
             "進捗%": f"{prog_profit:.0f}" if prog_profit is not None else "-",
-            "期": prog.get("period", ""),
-            "PDF": "✅" if tdoc.get("pdf_local_path") and Path(tdoc["pdf_local_path"]).exists() else ("❌" if tdoc else ""),
+            "PDF": "✅" if tdoc.get("pdf_local_path") and Path(tdoc["pdf_local_path"]).exists() else "",
         })
-        row_codes.append(score.code)
+        ranking_codes.append(score.code)
+elif tdnet_count > 0:
+    # スコアリング未実施: TDnetデータを表示
+    for code, info in sorted(tdnet_map.items()):
+        ranking_rows.append({
+            "スコア": "-",
+            "区分": "-",
+            "コード": code,
+            "銘柄名": info["company_name"],
+            "セクター": "",
+            "売上YoY": "-",
+            "営利YoY": "-",
+            "純利YoY": "-",
+            "進捗%": "-",
+            "PDF": "✅" if info["pdf_local_path"] and Path(info["pdf_local_path"]).exists() else "",
+        })
+        ranking_codes.append(code)
 
-    if rows:
-        df = pd.DataFrame(rows)
-        st.caption(f"表示: {len(rows)}件 / 全{total_scores}件 — **行を選択して詳細表示・AI分析**")
 
-        event = st.dataframe(
-            df,
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            height=min(600, 35 * len(rows) + 40),
-            column_config={
-                "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%.1f"),
-            },
-            key="score_ranking",
-        )
+# ═══════════════════════════════════════════
+# メインレイアウト: 左=ランキング / 右=詳細
+# ═══════════════════════════════════════════
+left_col, right_col = st.columns([2, 3], gap="medium")
 
-        # 選択された行の銘柄を取得 + アクションボタン表示
-        if event and event.selection and event.selection.rows:
-            sel_idx = event.selection.rows[0]
-            if sel_idx < len(row_codes):
-                sel_code = row_codes[sel_idx]
-                st.session_state.selected_code = sel_code
-                sel_tdoc = tdnet_map.get(sel_code, {})
-                sel_name = rows[sel_idx].get("銘柄名", "")
+# ───────────────────────────────────────────
+# 左カラム: ランキング一覧
+# ───────────────────────────────────────────
+with left_col:
+    st.markdown('<div class="section-header">🏆 一覧</div>', unsafe_allow_html=True)
 
-                st.markdown(f"**選択中: {sel_code} {sel_name}**")
-                btn_c1, btn_c2, btn_c3 = st.columns(3)
-                with btn_c1:
-                    if sel_tdoc.get("document_url"):
-                        st.link_button("📄 TDnetで開く", sel_tdoc["document_url"], use_container_width=True)
-                    else:
-                        st.button("📄 TDnet未取得", disabled=True, use_container_width=True)
-                with btn_c2:
-                    pp = sel_tdoc.get("pdf_local_path", "")
-                    if pp and Path(pp).exists():
-                        st.download_button("📥 PDFダウンロード", data=Path(pp).read_bytes(),
-                                           file_name=Path(pp).name, mime="application/pdf",
-                                           use_container_width=True, key="score_sel_dl")
-                    else:
-                        st.button("📥 PDF未DL", disabled=True, use_container_width=True)
-                with btn_c3:
-                    if st.button("🤖 AI分析実行", use_container_width=True, key="score_sel_ai"):
-                        with st.spinner(f"{sel_code} AI分析中..."):
-                            result = run_single_ai_analysis(sel_code, target_date_str)
-                            if result.get("is_error"):
-                                st.error(f"AI分析エラー: {result.get('error', '')}")
-                            else:
-                                st.success("AI分析完了!")
-                        st.rerun()
+    if not ranking_rows:
+        st.info("データがありません。サイドバーからデータを同期してください。")
     else:
-        st.info("フィルタ条件に一致するデータがありません")
+        # フィルタ (コンパクト)
+        if total_scores > 0:
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                min_score = st.slider("最低スコア", 0, 100, 0, 5, key="filter_score")
+            with fc2:
+                category_filter = st.multiselect("区分", ["注目", "要確認", "通常"], default=["注目", "要確認"], key="filter_cat")
 
+            # フィルタ適用
+            filtered_rows = []
+            filtered_codes = []
+            for row, code in zip(ranking_rows, ranking_codes):
+                if row["スコア"] != "-" and row["スコア"] < min_score:
+                    continue
+                if category_filter and row["区分"] not in category_filter:
+                    continue
+                filtered_rows.append(row)
+                filtered_codes.append(code)
+        else:
+            filtered_rows = ranking_rows
+            filtered_codes = ranking_codes
 
-# ═══════════════════════════════════════════
-# セクション2: 銘柄詳細 (選択された銘柄)
-# ═══════════════════════════════════════════
-st.markdown('<div class="section-header">🔍 銘柄詳細</div>', unsafe_allow_html=True)
+        st.caption(f"{len(filtered_rows)}件表示 — 行クリックで右側に詳細表示")
 
-# 銘柄選択用のコード一覧を構築 (FinancialStatement + TDnet)
-session = get_session()
-try:
-    codes_from_fs = set(
-        r[0] for r in session.query(FinancialStatement.code)
-        .filter(FinancialStatement.disclosed_date == dt).distinct().all()
-    )
-    codes_from_tdnet = set(
-        r[0] for r in session.query(TDnetDisclosure.code)
-        .filter(TDnetDisclosure.disclosed_date == dt, TDnetDisclosure.is_earnings_report == 1,
-                TDnetDisclosure.code != None, TDnetDisclosure.code != "")
-        .distinct().all()
-    )
-    codes_for_date = sorted(codes_from_fs | codes_from_tdnet)
-finally:
-    session.close()
+        if filtered_rows:
+            df = pd.DataFrame(filtered_rows)
 
-if codes_for_date:
-    # コード → 名前マッピング
-    session = get_session()
-    try:
-        stock_options = {}
-        for code in codes_for_date:
-            stock = session.query(Stock).filter_by(code=code).first()
-            if stock:
-                stock_options[f"{code} {stock.name}"] = code
-            else:
-                tdnet_info = tdnet_map.get(code, {})
-                stock_options[f"{code} {tdnet_info.get('company_name', '')}"] = code
-    finally:
-        session.close()
-
-    options_list = list(stock_options.keys())
-    codes_list = list(stock_options.values())
-    default_idx = 0
-    if st.session_state.selected_code and st.session_state.selected_code in codes_list:
-        default_idx = codes_list.index(st.session_state.selected_code)
-
-    selected_label = st.selectbox(
-        "銘柄を選択（ランキング行クリックでも選択可能）",
-        options=options_list,
-        index=default_idx,
-    )
-    selected_code = stock_options.get(selected_label, "")
-    if selected_code != st.session_state.selected_code:
-        st.session_state.selected_code = selected_code
-
-    if selected_code:
-        # ── アクションバー ──
-        acol1, acol2, acol3, acol4 = st.columns(4)
-
-        with acol1:
-            if st.button("🤖 この銘柄をAI分析", type="primary", use_container_width=True):
-                with st.spinner(f"{selected_code} AI分析中..."):
-                    result = run_single_ai_analysis(selected_code, target_date_str)
-                    if result.get("is_error"):
-                        st.error(f"AI分析エラー: {result.get('error', '不明')}")
-                    else:
-                        st.success("AI分析完了！")
-                st.rerun()
-
-        tdoc = tdnet_map.get(selected_code, {})
-        with acol2:
-            if tdoc.get("document_url"):
-                st.link_button("📄 TDnetで開く", tdoc["document_url"], use_container_width=True)
-            else:
-                st.button("📄 TDnet未取得", disabled=True, use_container_width=True, key="detail_tdnet_disabled")
-
-        with acol3:
-            pdf_path = tdoc.get("pdf_local_path", "")
-            if pdf_path and Path(pdf_path).exists():
-                st.download_button(
-                    "📥 PDFダウンロード",
-                    data=Path(pdf_path).read_bytes(),
-                    file_name=Path(pdf_path).name,
-                    mime="application/pdf",
-                    use_container_width=True,
+            column_config = {}
+            if total_scores > 0:
+                column_config["スコア"] = st.column_config.ProgressColumn(
+                    "スコア", min_value=0, max_value=100, format="%.0f"
                 )
-            else:
-                st.button("📥 PDF未DL", disabled=True, use_container_width=True, key="detail_pdf_disabled")
 
-        with acol4:
-            prog = get_forecast_progress_batch([selected_code], dt).get(selected_code, {})
-            if prog:
-                pp = prog.get("純利")
-                std = prog.get("standard", 0)
-                period = prog.get("period", "")
-                if pp is not None:
-                    color = "🟢" if pp >= std else ("🟡" if pp >= std * 0.8 else "🔴")
-                    st.metric(f"通期進捗 ({period})", f"{color} {pp:.0f}%", delta=f"標準{std}%")
-                else:
-                    st.metric(f"通期進捗 ({period})", "N/A")
+            event = st.dataframe(
+                df,
+                width="stretch",
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                height=min(700, 35 * len(filtered_rows) + 40),
+                column_config=column_config,
+                key="main_ranking",
+            )
 
-        # ── 2カラム ──
-        detail_col1, detail_col2 = st.columns([1, 1])
+            # 選択された行 → selected_code を更新
+            if event and event.selection and event.selection.rows:
+                sel_idx = event.selection.rows[0]
+                if sel_idx < len(filtered_codes):
+                    st.session_state.selected_code = filtered_codes[sel_idx]
 
-        # ── 左: 業績推移 ──
-        with detail_col1:
-            st.subheader("📈 四半期業績推移")
+            # 選択中の銘柄に対するアクションボタン
+            if st.session_state.selected_code:
+                sel = st.session_state.selected_code
+                tdoc = tdnet_map.get(sel, {})
+                sel_name = ""
+                for row in filtered_rows:
+                    if row["コード"] == sel:
+                        sel_name = row["銘柄名"]
+                        break
+
+                st.markdown(f"**▶ {sel} {sel_name}**")
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    if tdoc.get("document_url"):
+                        st.link_button("📄 TDnet", tdoc["document_url"], use_container_width=True)
+                    else:
+                        st.button("📄 TDnet", disabled=True, use_container_width=True, key="left_tdnet_dis")
+                with ac2:
+                    pp = tdoc.get("pdf_local_path", "")
+                    if pp and Path(pp).exists():
+                        st.download_button("📥 PDF", data=Path(pp).read_bytes(),
+                                           file_name=Path(pp).name, mime="application/pdf",
+                                           use_container_width=True, key="left_pdf_dl")
+                    else:
+                        st.button("📥 PDF", disabled=True, use_container_width=True, key="left_pdf_dis")
+                with ac3:
+                    if st.button("🤖 AI分析", use_container_width=True, key="left_ai_btn"):
+                        with st.spinner(f"{sel} AI分析中..."):
+                            result = run_single_ai_analysis(sel, target_date_str)
+                            if result.get("is_error"):
+                                st.error(result.get("error", ""))
+                            else:
+                                st.success("完了!")
+                        st.rerun()
+
+
+# ───────────────────────────────────────────
+# 右カラム: 銘柄詳細
+# ───────────────────────────────────────────
+with right_col:
+    st.markdown('<div class="section-header">🔍 銘柄詳細</div>', unsafe_allow_html=True)
+
+    selected_code = st.session_state.selected_code
+
+    if not selected_code:
+        st.info("← ランキングから銘柄を選択してください")
+    else:
+        # 銘柄情報取得
+        session = get_session()
+        try:
+            stock = session.query(Stock).filter_by(code=selected_code).first()
+            stock_name = stock.name if stock else ""
+            stock_sector = stock.sector_33_name if stock else ""
+            if not stock_name:
+                ti = tdnet_map.get(selected_code, {})
+                stock_name = ti.get("company_name", "")
+        finally:
+            session.close()
+
+        st.markdown(f"### {selected_code} {stock_name}")
+        if stock_sector:
+            st.caption(f"セクター: {stock_sector}")
+
+        # ── タブで整理 ──
+        tab_financial, tab_ai, tab_docs = st.tabs(["📈 業績", "🤖 AI分析", "📄 開示資料"])
+
+        # ─── タブ1: 業績 ───
+        with tab_financial:
             session = get_session()
             try:
                 all_stmts = (
@@ -614,6 +540,7 @@ if codes_for_date:
                 session.close()
 
             if all_stmts:
+                # チャート
                 chart_data = []
                 for s in all_stmts:
                     lbl = ""
@@ -625,13 +552,15 @@ if codes_for_date:
                 if not cdf.empty and cdf["期間"].any():
                     fig = go.Figure()
                     fig.add_trace(go.Bar(x=cdf["期間"], y=cdf["売上高"], name="売上高", marker_color="#667eea"))
-                    fig.add_trace(go.Scatter(x=cdf["期間"], y=cdf["営業利益"], name="営業利益", mode="lines+markers", line=dict(color="#e74c3c", width=3), yaxis="y2"))
-                    fig.add_trace(go.Scatter(x=cdf["期間"], y=cdf["純利益"], name="純利益", mode="lines+markers", line=dict(color="#2ecc71", width=2, dash="dot"), yaxis="y2"))
+                    fig.add_trace(go.Scatter(x=cdf["期間"], y=cdf["営業利益"], name="営業利益",
+                                             mode="lines+markers", line=dict(color="#e74c3c", width=3), yaxis="y2"))
+                    fig.add_trace(go.Scatter(x=cdf["期間"], y=cdf["純利益"], name="純利益",
+                                             mode="lines+markers", line=dict(color="#2ecc71", width=2, dash="dot"), yaxis="y2"))
                     fig.update_layout(
-                        height=350, margin=dict(l=20, r=20, t=30, b=20),
+                        height=300, margin=dict(l=10, r=10, t=20, b=10),
                         yaxis=dict(title="売上高", side="left"),
                         yaxis2=dict(title="利益", overlaying="y", side="right"),
-                        legend=dict(orientation="h", y=-0.15), hovermode="x unified",
+                        legend=dict(orientation="h", y=-0.2), hovermode="x unified",
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -640,49 +569,43 @@ if codes_for_date:
                 yoy = fa.compare_year_over_year(selected_code)
                 qoq = fa.compare_quarter_over_quarter(selected_code)
 
-                comp = {
-                    "指標": ["売上高", "営業利益", "経常利益", "純利益"],
-                    "YoY": [
-                        f"{yoy.get('yoy_net_sales'):+.1f}%" if yoy.get("yoy_net_sales") is not None else "-",
-                        f"{yoy.get('yoy_operating_profit'):+.1f}%" if yoy.get("yoy_operating_profit") is not None else "-",
-                        f"{yoy.get('yoy_ordinary_profit'):+.1f}%" if yoy.get("yoy_ordinary_profit") is not None else "-",
-                        f"{yoy.get('yoy_profit'):+.1f}%" if yoy.get("yoy_profit") is not None else "-",
-                    ],
-                    "QoQ": [
-                        f"{qoq.get('qoq_net_sales'):+.1f}%" if qoq.get("qoq_net_sales") is not None else "-",
-                        f"{qoq.get('qoq_operating_profit'):+.1f}%" if qoq.get("qoq_operating_profit") is not None else "-",
-                        f"{qoq.get('qoq_ordinary_profit'):+.1f}%" if qoq.get("qoq_ordinary_profit") is not None else "-",
-                        f"{qoq.get('qoq_profit'):+.1f}%" if qoq.get("qoq_profit") is not None else "-",
-                    ],
-                }
-                st.dataframe(pd.DataFrame(comp), width="stretch", hide_index=True)
+                comp_col1, comp_col2 = st.columns(2)
+                with comp_col1:
+                    st.markdown("**前年同期比 (YoY)**")
+                    for label, key in [("売上高", "yoy_net_sales"), ("営業利益", "yoy_operating_profit"), ("純利益", "yoy_profit")]:
+                        v = yoy.get(key)
+                        st.markdown(f"- {label}: **{v:+.1f}%**" if v is not None else f"- {label}: -")
+                with comp_col2:
+                    st.markdown("**前四半期比 (QoQ)**")
+                    for label, key in [("売上高", "qoq_net_sales"), ("営業利益", "qoq_operating_profit"), ("純利益", "qoq_profit")]:
+                        v = qoq.get(key)
+                        st.markdown(f"- {label}: **{v:+.1f}%**" if v is not None else f"- {label}: -")
 
-                # 進捗テーブル
+                # 通期予想進捗
+                prog = get_forecast_progress_batch([selected_code], dt).get(selected_code, {})
                 if prog and prog.get("standard"):
                     st.markdown("**📊 通期予想進捗**")
-                    pdata = {
-                        "指標": ["売上高", "営業利益", "純利益"],
-                        "進捗率": [
-                            f"{prog.get('売上', 0):.1f}%" if prog.get("売上") is not None else "-",
-                            f"{prog.get('営利', 0):.1f}%" if prog.get("営利") is not None else "-",
-                            f"{prog.get('純利', 0):.1f}%" if prog.get("純利") is not None else "-",
-                        ],
-                        "標準": [f"{prog['standard']}%"] * 3,
-                    }
-                    st.dataframe(pd.DataFrame(pdata), width="stretch", hide_index=True)
+                    pc1, pc2, pc3 = st.columns(3)
+                    for col, label in zip([pc1, pc2, pc3], ["売上", "営利", "純利"]):
+                        val = prog.get(label)
+                        std = prog["standard"]
+                        if val is not None:
+                            color = "🟢" if val >= std else ("🟡" if val >= std * 0.8 else "🔴")
+                            col.metric(label, f"{color} {val:.0f}%", delta=f"標準{std}%")
+                        else:
+                            col.metric(label, "N/A")
 
                 # シグナル
                 signals = fa.detect_signals(selected_code)
                 if signals:
-                    st.subheader("⚡ 検出シグナル")
+                    st.markdown("**⚡ 検出シグナル**")
                     for sig in signals:
                         st.markdown(f"- {sig}")
             else:
-                st.info("決算データがありません（J-Quants決算情報を同期してください）")
+                st.info("決算データなし（J-Quants決算情報を同期してください）")
 
-        # ── 右: AI分析 + 開示資料 ──
-        with detail_col2:
-            st.subheader("🤖 AI分析結果")
+        # ─── タブ2: AI分析 ───
+        with tab_ai:
             session = get_session()
             try:
                 ai_result = (
@@ -695,81 +618,41 @@ if codes_for_date:
                 session.close()
 
             if ai_result and ai_result.summary:
-                summary_text = ai_result.summary
-                # エラー結果は再分析を促す
-                if summary_text.startswith("分析エラー:"):
-                    st.warning(f"前回の分析でエラーが発生しています: {summary_text[:100]}")
-                    st.info("「🤖 この銘柄をAI分析」ボタンで再分析してください。")
+                display = parse_ai_display(ai_result)
+
+                if display.get("is_error"):
+                    st.warning(f"前回の分析でエラー: {display['error'][:100]}")
+                    st.info("上のアクションバーから「🤖 AI分析」で再実行してください。")
                 else:
-                    # summaryにJSON文字列が格納されている場合のリカバリ
-                    display_summary = summary_text
-                    display_kps = []
-                    display_kws = []
-                    display_sws = []
-                    display_sentiment = ai_result.sentiment or "neutral"
-
-                    if summary_text.lstrip().startswith(("{", "```")):
-                        import re
-                        # JSONを抽出して正しいフィールドを取得
-                        fence_m = re.search(r'```(?:json)?\s*\n?(\{.*)', summary_text, re.DOTALL)
-                        json_candidate = fence_m.group(1).rstrip('`').strip() if fence_m else summary_text.strip().lstrip('`').strip()
-                        if json_candidate.count("{") > json_candidate.count("}"):
-                            json_candidate += "}" * (json_candidate.count("{") - json_candidate.count("}"))
-                        try:
-                            parsed = json.loads(json_candidate)
-                            display_summary = parsed.get("summary", summary_text[:300])
-                            display_kps = parsed.get("key_points", [])
-                            display_kws = parsed.get("keywords", [])
-                            display_sws = parsed.get("signal_words", [])
-                            display_sentiment = parsed.get("sentiment", display_sentiment)
-                        except (json.JSONDecodeError, AttributeError):
-                            # regex抽出にも失敗 — summaryキーだけ取得
-                            sum_m = re.search(r'"summary"\s*:\s*"([^"]*)"', summary_text)
-                            if sum_m:
-                                display_summary = sum_m.group(1)
-                    else:
-                        # 正常な保存データ
-                        try:
-                            display_kps = json.loads(ai_result.key_points) if ai_result.key_points else []
-                        except json.JSONDecodeError:
-                            display_kps = []
-                        try:
-                            display_kws = json.loads(ai_result.keywords) if ai_result.keywords else []
-                        except json.JSONDecodeError:
-                            display_kws = []
-                        try:
-                            display_sws = json.loads(ai_result.signal_words) if ai_result.signal_words else []
-                        except json.JSONDecodeError:
-                            display_sws = []
-
                     sentiment_emoji = {"positive": "🟢 ポジティブ", "negative": "🔴 ネガティブ", "neutral": "🟡 ニュートラル"}
-                    st.markdown(f"**センチメント:** {sentiment_emoji.get(display_sentiment, '❓')}")
-                    st.markdown("**📝 要約:**")
-                    st.markdown(display_summary)
+                    st.markdown(f"**センチメント:** {sentiment_emoji.get(display['sentiment'], '❓')}")
 
-                    if display_kps:
+                    st.markdown("**📝 要約:**")
+                    st.markdown(display["summary"])
+
+                    if display["key_points"]:
                         st.markdown("**🔑 注目ポイント:**")
-                        for kp in display_kps:
+                        for kp in display["key_points"]:
                             st.markdown(f"- {kp}")
 
-                    if display_kws:
+                    if display["keywords"]:
                         st.markdown("**🏷️ キーワード:**")
                         st.markdown(" ".join(
                             f'<span style="background:#667eea;color:white;padding:2px 8px;border-radius:10px;margin:2px;display:inline-block;font-size:12px">{kw}</span>'
-                            for kw in display_kws
+                            for kw in display["keywords"]
                         ), unsafe_allow_html=True)
 
-                    if display_sws:
+                    if display["signal_words"]:
                         st.markdown("**⚡ シグナルワード:**")
-                        for sw in display_sws:
+                        for sw in display["signal_words"]:
                             st.markdown(f"- {sw}")
 
                     st.caption(f"モデル: {ai_result.model_used} | 分析: {ai_result.analyzed_at}")
             else:
-                st.info("AI分析結果なし。「🤖 この銘柄をAI分析」ボタンで実行してください。")
+                st.info("AI分析結果なし。左側のアクションバーから「🤖 AI分析」で実行してください。")
 
-            # 開示資料一覧
-            st.subheader("📄 開示資料")
+        # ─── タブ3: 開示資料 ───
+        with tab_docs:
             session = get_session()
             try:
                 all_docs = (
@@ -783,69 +666,20 @@ if codes_for_date:
 
             if docs_data:
                 for di, doc in enumerate(docs_data):
-                    with st.expander(doc["title"] or "書類"):
-                        bc1, bc2 = st.columns(2)
-                        if doc["document_url"]:
-                            bc1.link_button("🔗 TDnetで開く", doc["document_url"], use_container_width=True)
-                        lp = doc.get("pdf_local_path", "")
-                        if lp and Path(lp).exists():
-                            bc2.download_button(
-                                "📥 保存済PDFを取得", data=Path(lp).read_bytes(),
-                                file_name=Path(lp).name, mime="application/pdf",
-                                use_container_width=True, key=f"dl_{selected_code}_{di}",
-                            )
-                        else:
-                            bc2.caption("未ダウンロード")
+                    st.markdown(f"**{doc['title'] or '書類'}**")
+                    dc1, dc2 = st.columns(2)
+                    if doc["document_url"]:
+                        dc1.link_button("🔗 TDnetで開く", doc["document_url"], use_container_width=True, key=f"doc_tdnet_{di}")
+                    lp = doc.get("pdf_local_path", "")
+                    if lp and Path(lp).exists():
+                        dc2.download_button("📥 保存済PDF", data=Path(lp).read_bytes(),
+                                            file_name=Path(lp).name, mime="application/pdf",
+                                            use_container_width=True, key=f"doc_pdf_{di}")
+                    else:
+                        dc2.caption("未ダウンロード")
+                    st.divider()
             else:
                 st.info("TDnet開示データがありません")
-else:
-    st.info("対象日のデータがありません。サイドバーからデータを同期してください。")
-
-
-# ═══════════════════════════════════════════
-# セクション3: AI分析サマリー一覧
-# ═══════════════════════════════════════════
-st.markdown('<div class="section-header">🤖 AI分析サマリー一覧</div>', unsafe_allow_html=True)
-
-session = get_session()
-try:
-    ai_all = (
-        session.query(AIAnalysisResult, Stock.name)
-        .outerjoin(Stock, AIAnalysisResult.code == Stock.code)
-        .filter(AIAnalysisResult.disclosed_date == dt).all()
-    )
-finally:
-    session.close()
-
-if ai_all:
-    ai_rows = []
-    error_count = 0
-    for ai, name in ai_all:
-        summary = ai.summary or ""
-        # エラー結果はスキップ
-        if summary.startswith("分析エラー:"):
-            error_count += 1
-            continue
-        try:
-            kws = json.loads(ai.keywords) if ai.keywords else []
-        except json.JSONDecodeError:
-            kws = []
-        sentiment_map = {"positive": "🟢 ポジティブ", "negative": "🔴 ネガティブ", "neutral": "🟡 ニュートラル"}
-        ai_rows.append({
-            "コード": ai.code,
-            "銘柄名": name or "",
-            "センチメント": sentiment_map.get(ai.sentiment, ai.sentiment or ""),
-            "要約": summary[:120] + ("..." if len(summary) > 120 else ""),
-            "キーワード": ", ".join(kws[:5]) if kws else "",
-        })
-    if ai_rows:
-        st.dataframe(pd.DataFrame(ai_rows), width="stretch", hide_index=True)
-    if error_count > 0:
-        st.caption(f"⚠️ {error_count}件のエラー結果は非表示（API制限等）")
-    if not ai_rows and error_count == 0:
-        st.info("AI分析結果がありません")
-else:
-    st.info("AI分析結果がありません")
 
 
 # ═══════════════════════════════════════════
