@@ -247,35 +247,77 @@ class AIAnalyzer:
     # レスポンスパーサ
     # ------------------------------------------------------------------
     def _parse_response(self, response_text: str) -> dict:
-        """GeminiレスポンスからJSON抽出・パース"""
+        """GeminiレスポンスからJSON抽出・パース (堅牢版)"""
         import re
 
+        def _extract_fields(data: dict) -> dict:
+            return {
+                "summary": data.get("summary", ""),
+                "key_points": data.get("key_points", []),
+                "keywords": data.get("keywords", []),
+                "sentiment": data.get("sentiment", "neutral"),
+                "signal_words": data.get("signal_words", []),
+            }
+
+        # 戦略1: ```json ... ``` コードフェンスからJSON抽出
         json_match = re.search(
             r"```(?:json)?\s*\n?(.*?)\n?\s*```", response_text, re.DOTALL
         )
         if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_str = response_text.strip()
+            try:
+                return _extract_fields(json.loads(json_match.group(1)))
+            except json.JSONDecodeError:
+                pass
 
+        # 戦略2: ```json で始まるが閉じていない場合 (Geminiの出力が途切れた場合)
+        fence_match = re.search(r"```(?:json)?\s*\n?(\{.*)", response_text, re.DOTALL)
+        if fence_match:
+            json_candidate = fence_match.group(1).rstrip("`").strip()
+            # 閉じ括弧がない場合は追加して修復を試行
+            if json_candidate.count("{") > json_candidate.count("}"):
+                json_candidate += "}" * (json_candidate.count("{") - json_candidate.count("}"))
+            try:
+                return _extract_fields(json.loads(json_candidate))
+            except json.JSONDecodeError:
+                pass
+
+        # 戦略3: テキスト全体をJSONとしてパース
+        stripped = response_text.strip().rstrip("`").strip()
         try:
-            result = json.loads(json_str)
-            return {
-                "summary": result.get("summary", ""),
-                "key_points": result.get("key_points", []),
-                "keywords": result.get("keywords", []),
-                "sentiment": result.get("sentiment", "neutral"),
-                "signal_words": result.get("signal_words", []),
-            }
+            return _extract_fields(json.loads(stripped))
         except json.JSONDecodeError:
-            logger.warning("JSONパース失敗。テキストレスポンスを使用。")
+            pass
+
+        # 戦略4: { で始まる部分をJSON候補として抽出
+        brace_match = re.search(r"\{.*", stripped, re.DOTALL)
+        if brace_match:
+            candidate = brace_match.group(0)
+            if candidate.count("{") > candidate.count("}"):
+                candidate += "}" * (candidate.count("{") - candidate.count("}"))
+            try:
+                return _extract_fields(json.loads(candidate))
+            except json.JSONDecodeError:
+                pass
+
+        # 全戦略失敗: テキストから要約を抽出
+        logger.warning("全JSON抽出戦略失敗。テキストレスポンスを使用。")
+        # "summary" キーが含まれていたら手動で抽出を試行
+        sum_match = re.search(r'"summary"\s*:\s*"([^"]*)"', response_text)
+        if sum_match:
             return {
-                "summary": response_text[:500],
+                "summary": sum_match.group(1),
                 "key_points": [],
                 "keywords": [],
                 "sentiment": "neutral",
                 "signal_words": [],
             }
+        return {
+            "summary": response_text[:500],
+            "key_points": [],
+            "keywords": [],
+            "sentiment": "neutral",
+            "signal_words": [],
+        }
 
     # ------------------------------------------------------------------
     # DB連携: 分析 → 保存
