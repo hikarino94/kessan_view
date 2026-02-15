@@ -1,0 +1,28 @@
+# Web UI
+streamlit>=1.30.0
+
+# HTTP / API
+requests>=2.31.0
+
+# データ操作
+pandas>=2.1.0
+numpy>=1.25.0
+
+# DB
+sqlalchemy>=2.0.0
+
+# チャート
+plotly>=5.18.0
+
+# PDF
+pdfplumber>=0.10.0
+
+# AI
+google-genai>=1.0.0
+
+# 環境変数
+python-dotenv>=1.0.0
+
+# テスト
+pytest>=7.4.0
+pytest-mock>=3.12.0
